@@ -1,0 +1,4 @@
+linkedin_url,email,first_name,last_name,title,company,location,phone
+https://www.linkedin.com/in/jane-doe-example/,,Jane,Doe,Software Engineer,Acme Inc,"Berlin, Germany",
+,jane.recruiter@acme.com,Jane,Recruiter,Recruiter,Acme Inc,"Berlin, Germany",+49 30 1234567
+https://www.linkedin.com/in/john-smith-example/,john.smith@acme.com,John,Smith,New Grad SWE,Acme Inc,"Remote",

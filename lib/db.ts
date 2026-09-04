@@ -10,14 +10,24 @@ let db: Database.Database;
 
 export function getDb(): Database.Database {
   if (!db) {
-    db = new Database(DB_PATH);
-    db.pragma("journal_mode = WAL");
-    db.pragma("foreign_keys = ON");
-    initDb(db);
-    runMigrations(db);
+    db = createDatabase(DB_PATH);
     scheduleUpdateCheck();
   }
   return db;
+}
+
+/**
+ * Opens (or creates) a fully-migrated database at the given path, e.g. ":memory:" for
+ * tests. Exported so test suites can get an isolated DB without going through the
+ * process-wide getDb() singleton — same schema/migrations as production.
+ */
+export function createDatabase(dbPath: string): Database.Database {
+  const instance = new Database(dbPath);
+  instance.pragma("journal_mode = WAL");
+  instance.pragma("foreign_keys = ON");
+  initDb(instance);
+  runMigrations(instance);
+  return instance;
 }
 
 function runParallelTracksMigration(db: Database.Database) {
@@ -472,6 +482,40 @@ function runMigrations(db: Database.Database) {
     "ALTER TABLE lists ADD COLUMN purpose TEXT",
     // Manual/CSV-only field — no automation reads or writes this, reference data only.
     "ALTER TABLE targets ADD COLUMN phone TEXT",
+    // Dropbox intake: one row per observed batch FOLDER (claimed by source_path — the
+    // atomic "have we seen this folder before" guard, safe under concurrent pollers since
+    // it relies on the UNIQUE constraint, not an in-memory lock). batch_id is filled in once
+    // campaign.json is readable and is separately unique (partial index below) so the same
+    // batch_id reappearing under a different path is caught as a conflict instead of silently
+    // creating a second list/run. See lib/dropbox/intake.ts for the full state machine.
+    `CREATE TABLE IF NOT EXISTS dropbox_intake_batches (
+      id TEXT PRIMARY KEY,
+      source_path TEXT NOT NULL UNIQUE,
+      batch_id TEXT,
+      content_hash TEXT,
+      dropbox_rev TEXT,
+      status TEXT NOT NULL DEFAULT 'discovered' CHECK(status IN (
+        'discovered', 'processing', 'imported', 'launched', 'completed',
+        'retryable_error', 'terminal_error'
+      )),
+      phase TEXT,
+      manifest_json TEXT,
+      list_id TEXT REFERENCES lists(id),
+      run_id TEXT REFERENCES runs(id),
+      imported_count INTEGER NOT NULL DEFAULT 0,
+      updated_count INTEGER NOT NULL DEFAULT 0,
+      skipped_count INTEGER NOT NULL DEFAULT 0,
+      failed_count INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      archived_at TEXT,
+      claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_dropbox_intake_batch_id ON dropbox_intake_batches(batch_id) WHERE batch_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_dropbox_intake_status ON dropbox_intake_batches(status)",
   ];
   for (const sql of migrations) {
     try { db.exec(sql); } catch { /* column already exists */ }

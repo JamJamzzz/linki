@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "batch_id": "ixl-swe-ng-31102",
+  "list_name": "IXL SWE New Grad",
+  "workflow_id": "REPLACE-WITH-AN-EXISTING-WORKFLOW-ID",
+  "linkedin_account_id": "REPLACE-WITH-AN-EXISTING-LINKEDIN-ACCOUNT-ID",
+  "email_account_id": null,
+  "auto_launch": true
+}

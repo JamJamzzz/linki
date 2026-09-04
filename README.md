@@ -190,6 +190,13 @@ Go to **Lists → New list** and paste a LinkedIn Sales Navigator list URL. Link
 
 Go to **Workflows → New workflow**. Add your steps — LinkedIn actions, email steps, delays — write your messages (or use templates and A/B pools), then create a run and launch.
 
+### 7. Automate imports from Dropbox (optional)
+
+Instead of importing lists by hand, Linki can watch a Dropbox folder and turn each ready
+batch (a manifest + a CSV) into a list — optionally launching an existing workflow
+automatically. Disabled by default; see [`docs/dropbox-intake.md`](docs/dropbox-intake.md)
+for setup.
+
 ---
 
 ## Managed edition

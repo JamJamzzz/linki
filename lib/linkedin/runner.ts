@@ -958,6 +958,12 @@ async function globalLoop(): Promise<void> {
     } catch (err) {
       console.error("[runner] Import scheduler error:", err instanceof Error ? err.message : err);
     }
+    try {
+      const { processDropboxIntakeTick } = await import("@/lib/dropbox/intake");
+      await processDropboxIntakeTick(db);
+    } catch (err) {
+      console.error("[runner] Dropbox intake error:", err instanceof Error ? err.message : err);
+    }
     await sleep(POLL_INTERVAL_MS);
   }
 }
