@@ -32,11 +32,15 @@ function inmailCreditsExhaustedToday(accountId: string): boolean {
 const CONNECTION_RECHECK_HOURS = 6;
 // Max days to wait for acceptance before giving up
 const CONNECTION_MAX_WAIT_DAYS = 7;
-// Delay between profiles (seconds)
-const PROFILE_DELAY_MIN = 8;
-const PROFILE_DELAY_MAX = 20;
-// Poll interval (ms)
-const POLL_INTERVAL_MS = 30_000;
+// Delay between profiles (seconds). Personal single-user fork: this only needs to be
+// long enough for Playwright/the LinkedIn session to settle between actions, not to
+// look "human" for anti-bot purposes — kept small and non-zero for reliability.
+const PROFILE_DELAY_MIN = 1;
+const PROFILE_DELAY_MAX = 2;
+// Poll interval (ms). Personal fork: short enough that a newly-enrolled contact starts
+// processing within a few seconds and a zero-delay step chain (e.g. Visit -> Connect)
+// doesn't sit idle for a full old-style 30s cycle waiting for the next tick.
+const POLL_INTERVAL_MS = 3_000;
 
 interface ScheduleConfig {
   active_hours_start: number;
@@ -947,6 +951,16 @@ async function globalLoop(): Promise<void> {
   const db = getDb();
 
   while (true) {
+    try {
+      // Personal aggressive mode: pull every list contact into whatever campaign is
+      // currently running and strip Linki's local pacing off that run's account, before
+      // this tick's due-track query runs — so freshly-enrolled contacts are picked up
+      // in the very same iteration instead of waiting for the next one.
+      const { runPersonalAutoEnroll } = await import("@/lib/personal-auto");
+      await runPersonalAutoEnroll(db);
+    } catch (err) {
+      console.error("[runner] Personal auto-enroll error:", err instanceof Error ? err.message : err);
+    }
     try {
       await tick(db);
     } catch (err) {
