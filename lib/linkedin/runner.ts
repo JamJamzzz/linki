@@ -42,14 +42,14 @@ const PROFILE_DELAY_MAX = 2;
 // doesn't sit idle for a full old-style 30s cycle waiting for the next tick.
 const POLL_INTERVAL_MS = 3_000;
 
-interface ScheduleConfig {
+export interface ScheduleConfig {
   active_hours_start: number;
   active_hours_end: number;
   timezone: string;
   working_days: string;
 }
 
-interface AccountLimits extends ScheduleConfig {
+export interface AccountLimits extends ScheduleConfig {
   daily_connection_limit: number;
   daily_message_limit: number;
   daily_inmail_limit: number;
@@ -123,7 +123,7 @@ function nextScheduledSlot(account: ScheduleConfig): string {
   return new Date(Date.now() + 86_400_000).toISOString();
 }
 
-interface WorkflowStep {
+export interface WorkflowStep {
   id: string;
   step_order: number;
   track: "linkedin" | "email";
@@ -145,7 +145,7 @@ interface WorkflowStep {
 }
 
 // A track-run row joined with its parent run_profile and run context
-interface TrackRun {
+export interface TrackRun {
   // run_profile_tracks columns
   id: string;
   run_profile_id: string;
@@ -169,7 +169,7 @@ interface TrackRun {
   connection_requested_at: string | null;
 }
 
-interface Target {
+export interface Target {
   id: string;
   linkedin_url: string;
   sales_nav_url: string | null;
@@ -247,6 +247,24 @@ function trSkip(db: ReturnType<typeof getDb>, tr: TrackRun, reason: string) {
 
 function trFail(db: ReturnType<typeof getDb>, tr: TrackRun, reason: string) {
   db.prepare("UPDATE run_profile_tracks SET state = 'failed', error_message = ? WHERE id = ?").run(reason, tr.id);
+}
+
+/**
+ * Does a `connect` step at `fromIndex` have a later ordinary LinkedIn `message` step (in
+ * the same track's step list) that needs the target to actually be 1st-degree first? A
+ * `message` step unconditionally requires degree === 1 (see the "message" branch below), so
+ * its mere presence later in the SAME track is what makes a connect step worth waiting on
+ * acceptance for. `sales_inmail` reaches non-connections (no degree gate), and steps on the
+ * other track (e.g. an `email` step) are never in this array at all — getSteps() already
+ * filters by track — so this only needs to look for "message".
+ *
+ * Pure and workflow-shape-based on purpose — never keyed off a workflow name/id, so any
+ * fire-and-forget Connect-only campaign gets the fast path automatically, and any
+ * Connect -> ... -> Message campaign keeps waiting for acceptance, regardless of what
+ * either workflow happens to be called.
+ */
+export function hasFutureAcceptanceDependentMessage(steps: Pick<WorkflowStep, "step_type">[], fromIndex: number): boolean {
+  return steps.slice(fromIndex + 1).some((s) => s.step_type === "message");
 }
 
 function trRecordContext(db: ReturnType<typeof getDb>, tr: TrackRun, ctx: { linkedinMessage?: string; emailSubject?: string; emailBody?: string }) {
@@ -462,7 +480,7 @@ async function ensureApolloEnriched(db: ReturnType<typeof getDb>, target: Target
 
 // ─── step execution ──────────────────────────────────────────────────────────
 
-async function executeStep(
+export async function executeStep(
   db: ReturnType<typeof getDb>,
   runId: string,
   tr: TrackRun,
@@ -493,6 +511,9 @@ async function executeStep(
 
   const step = steps[stepIndex];
   const name = target.full_name ?? target.linkedin_url;
+  // Only meaningful for the "connect" branch/catch below — computed once here so both
+  // the try body and the PendingInviteError catch handler agree on it.
+  const requiresAcceptance = step.step_type === "connect" && hasFutureAcceptanceDependentMessage(steps, stepIndex);
 
   try {
     if (step.step_type === "delay") {
@@ -526,6 +547,27 @@ async function executeStep(
       if (freshTarget.degree === 1) {
         if (!freshTarget.connected_at) db.prepare("UPDATE targets SET connected_at = ? WHERE id = ?").run(nowIso(), target.id);
         log(db, runId, target.id, "info", `${name} already connected — skipping connect step`);
+        trAdvance(db, tr, steps);
+        return;
+      }
+
+      // Whether this connect step should keep waiting/rechecking for acceptance at all —
+      // only true when a later `message` step in this same workflow track actually needs
+      // the target to be 1st-degree. Otherwise sending the invite IS the completed outbound
+      // task (fire-and-forget referral/prospecting workflows).
+      if (!requiresAcceptance) {
+        if (freshTarget.connection_requested_at) {
+          log(db, runId, target.id, "info", `${name} — connection request already sent and no later step needs acceptance — completing connect step`);
+        } else {
+          db.prepare("UPDATE run_profile_tracks SET last_step_at = datetime('now') WHERE id = ?").run(tr.id);
+          log(db, runId, target.id, "info", `Sending connection request to ${name}`);
+          const linkedinUrl = await getLinkedinUrl(db, target, accountId);
+          const page = await getSessionPage(accountId);
+          try { await sendConnectionRequest(page, linkedinUrl); } finally { await page.close(); }
+          await saveSessionState(accountId);
+          db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
+          log(db, runId, target.id, "info", `Connection request sent to ${name} — outbound task complete (no later step needs acceptance)`);
+        }
         trAdvance(db, tr, steps);
         return;
       }
@@ -919,9 +961,14 @@ async function executeStep(
       return;
     }
     if (err instanceof PendingInviteError) {
-      log(db, runId, target.id, "info", `${name} invite already pending — will recheck`);
       if (!target.connection_requested_at) db.prepare("UPDATE targets SET connection_requested_at = ? WHERE id = ?").run(nowIso(), target.id);
-      trWait(db, tr, CONNECTION_RECHECK_HOURS);
+      if (!requiresAcceptance) {
+        log(db, runId, target.id, "info", `${name} invite already pending — no later step needs acceptance — completing connect step`);
+        trAdvance(db, tr, steps);
+      } else {
+        log(db, runId, target.id, "info", `${name} invite already pending — will recheck`);
+        trWait(db, tr, CONNECTION_RECHECK_HOURS);
+      }
       return;
     }
     if (msg.includes("No InMail credits left")) {

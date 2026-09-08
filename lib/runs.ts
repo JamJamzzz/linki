@@ -18,11 +18,38 @@ export type CreateRunResult =
   | { ok: false; error: "workflow_already_active"; message: string }
   | { ok: false; error: "all_already_enrolled"; message: string };
 
+// Step types that represent real follow-up outreach — a workflow containing any of these
+// keeps the one-active-run-per-workflow guard, since a connection-dependent message,
+// email sequence, or Sales Nav InMail campaign genuinely shouldn't have two batches
+// racing each other. Anything else (visit/connect/delay) is fire-and-forget: sending the
+// connection request IS the completed task, so several batches of the same simple
+// workflow are safe to run at once (see lib/linkedin/runner.ts's `connect` step, which no
+// longer blocks on acceptance for these).
+const FOLLOW_UP_STEP_TYPES = new Set(["message", "email", "sales_inmail"]);
+
+/**
+ * A workflow is "fire-and-forget" when it has at least one `connect` step and no step
+ * that represents real follow-up outreach (message/email/sales_inmail). Determined purely
+ * from workflow_steps — never from the workflow's name — so this stays correct for any
+ * workflow shaped this way, not just one particular campaign.
+ */
+export function isFireAndForgetWorkflow(db: DB, workflowId: string): boolean {
+  const stepTypes = (db.prepare(
+    "SELECT DISTINCT step_type FROM workflow_steps WHERE workflow_id = ?"
+  ).all(workflowId) as { step_type: string }[]).map((r) => r.step_type);
+  if (!stepTypes.includes("connect")) return false;
+  return !stepTypes.some((t) => FOLLOW_UP_STEP_TYPES.has(t));
+}
+
 /**
  * Create a run (enroll a list/targets into a workflow) exactly as
  * POST /api/runs does. Extracted so both the HTTP route and non-HTTP callers
  * (e.g. Dropbox intake) share one implementation — behavior is unchanged from
- * the original inline handler.
+ * the original inline handler, except that a fire-and-forget workflow (see
+ * isFireAndForgetWorkflow) is exempt from the one-active-run-per-workflow guard, so several
+ * batches of the same simple connect campaign can launch concurrently instead of queuing
+ * behind each other. Cross-run target dedup (the activeElsewhere check below) still applies
+ * regardless, so the same person is never enrolled into two active runs at once.
  */
 export function createRun(db: DB, params: CreateRunParams): CreateRunResult {
   const { workflowId, listId, accountId } = params;
@@ -37,7 +64,7 @@ export function createRun(db: DB, params: CreateRunParams): CreateRunResult {
   const activeRun = db.prepare(
     "SELECT id FROM runs WHERE workflow_id = ? AND status IN ('running', 'paused') LIMIT 1"
   ).get(workflowId) as { id: string } | undefined;
-  if (activeRun) {
+  if (activeRun && !isFireAndForgetWorkflow(db, workflowId)) {
     return {
       ok: false,
       error: "workflow_already_active",

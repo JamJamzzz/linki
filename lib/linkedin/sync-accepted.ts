@@ -1,6 +1,7 @@
 import type { Page } from "playwright";
 import { getDb } from "@/lib/db";
 import { getSessionPage, saveSessionState, markNeedsReauth } from "@/lib/linkedin/session";
+import { exportLinkedinStatusSnapshot } from "@/lib/dropbox/export-status";
 
 /**
  * Accepted-connection sync via the authoritative Voyager connections API.
@@ -36,7 +37,7 @@ import { getSessionPage, saveSessionState, markNeedsReauth } from "@/lib/linkedi
  *  - Reuses the runner's shared browser (getSessionPage) — never a 2nd browser.
  */
 
-const ACCEPTED_SYNC_INTERVAL_MS = 8 * 60 * 60 * 1000; // 8h — 3x per day
+const ACCEPTED_SYNC_INTERVAL_MS = 60 * 60 * 1000; // 1h — personal-fork: faster acceptance visibility for the referral pipeline
 const PAGE_SIZE = 100;
 const MAX_PAGES = 60; // safety cap (60 * 100 = 6000)
 const OVERLAP_MARGIN_MS = 24 * 60 * 60 * 1000; // re-check a day of overlap (idempotent)
@@ -183,6 +184,15 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
       try { await saveSessionState(accountId); } catch { /* ignore */ }
     }
     db.prepare("UPDATE accounts SET accepted_sync_at = datetime('now') WHERE id = ?").run(accountId);
+
+    // Best-effort feedback to the external referral scheduler — see lib/dropbox/export-status.ts.
+    // Runs regardless of how the try block above exited; failures are caught and logged
+    // inside exportLinkedinStatusSnapshot itself, this is just a last-resort safety net.
+    try {
+      await exportLinkedinStatusSnapshot(db);
+    } catch (err) {
+      console.warn("[sync-accepted] status export threw unexpectedly:", err instanceof Error ? err.message : err);
+    }
   }
 
   return stamped;
