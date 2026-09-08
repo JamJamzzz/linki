@@ -156,15 +156,25 @@ export async function syncAcceptedConnections(accountId: string, db: DatabaseTyp
     const seenVanities = new Set<string>(); // full-pass phantom check
     let uniquePulled = 0;
     let newestSeen: number | null = null;
+    // How the pagination loop ended — these decide whether this scan proved it covered
+    // the region it was responsible for (see the boundary commit rule below). Note that
+    // simply running out of MAX_PAGES leaves all three false: a safety-cap truncation is
+    // NOT end-of-list.
     let reachedBoundary = false;
+    let reachedEndOfList = false;
+    let fetchFailed = false;
 
     for (let pageIdx = 0; pageIdx < MAX_PAGES; pageIdx++) {
       const conns = await fetchConnectionsPage(page, pageIdx * PAGE_SIZE, PAGE_SIZE);
       if (conns === null) {
         console.warn(`[sync-accepted] connections API failed at start=${pageIdx * PAGE_SIZE} — stopping`);
+        fetchFailed = true;
         break;
       }
-      if (conns.length === 0) break; // end of list
+      if (conns.length === 0) {
+        reachedEndOfList = true;
+        break;
+      }
 
       for (const c of conns) {
         uniquePulled++;
@@ -232,15 +242,34 @@ export async function syncAcceptedConnections(accountId: string, db: DatabaseTyp
       console.warn(`[sync-accepted] Full pass NOT verified complete (pulled ${uniquePulled}, declared ${declaredTotal}) — add-only, no un-marking.`);
     }
 
-    // Advance the boundary to the newest connection seen this run.
-    if (newestSeen !== null) {
+    // Boundary commit rule: persistent pagination progress may only move forward when
+    // this scan PROVED it covered the region it was responsible for.
+    //  - FULL pass: proof is the completeness checksum (uniquePulled ≈ declaredTotal).
+    //    An incomplete/API-failed/cap-truncated full pass MUST leave the boundary NULL,
+    //    otherwise a half-finished historical repair silently downgrades itself into an
+    //    incremental pass and never revisits the connections it missed.
+    //  - INCREMENTAL pass: proof is crossing the old boundary's overlap margin, or
+    //    reaching the natural end of the Voyager list.
+    // Anything else keeps the previous boundary so the next due sync retries the same
+    // mode/range. Positive degree=1 stamps already proven by Voyager are add-only and
+    // are never rolled back by this.
+    const safeToAdvanceBoundary = isFullPass ? verifiedComplete : (reachedBoundary || reachedEndOfList);
+
+    if (newestSeen !== null && safeToAdvanceBoundary) {
       db.prepare("UPDATE accounts SET connections_synced_through_ms = ? WHERE id = ?").run(newestSeen, accountId);
+    } else if (newestSeen !== null) {
+      console.warn(
+        `[sync-accepted] Not advancing boundary — ${isFullPass ? "full" : "incremental"} pass did not prove ` +
+        `complete coverage${fetchFailed ? " (connections API failed mid-scan)" : ""}. Keeping ` +
+        `${boundary === null ? "NULL" : boundary} so the next due sync retries this range.`
+      );
     }
     // Store the declared total for visibility (Settings shows LinkedIn's count).
     if (declaredTotal !== null) {
       db.prepare("UPDATE accounts SET li_connections = ? WHERE id = ?").run(declaredTotal, accountId);
     }
-    console.log(`[sync-accepted] Stamped ${stamped} accepted, un-marked ${unmarked} phantom (boundary=${newestSeen}).`);
+    const committedBoundary = newestSeen !== null && safeToAdvanceBoundary ? newestSeen : boundary;
+    console.log(`[sync-accepted] Stamped ${stamped} accepted, un-marked ${unmarked} phantom (boundary=${committedBoundary}).`);
   } finally {
     // B5 safety: only persist the session if still on a valid page.
     let url = "";

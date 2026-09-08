@@ -39,10 +39,19 @@ function freshDb(): DB {
   return createDatabase(":memory:");
 }
 
-function seedAccount(db: DB): string {
+/** boundaryMs = accounts.connections_synced_through_ms; null (default) means a FULL pass. */
+function seedAccount(db: DB, boundaryMs: number | null = null): string {
   const id = randomUUID();
-  db.prepare("INSERT INTO accounts (id, name, email, is_authenticated) VALUES (?, 'Test Account', ?, 1)").run(id, `${id}@example.com`);
+  db.prepare(
+    "INSERT INTO accounts (id, name, email, is_authenticated, connections_synced_through_ms) VALUES (?, 'Test Account', ?, 1, ?)"
+  ).run(id, `${id}@example.com`, boundaryMs);
   return id;
+}
+
+function readBoundary(db: DB, accountId: string): number | null {
+  return (db.prepare("SELECT connections_synced_through_ms FROM accounts WHERE id = ?").get(accountId) as {
+    connections_synced_through_ms: number | null;
+  }).connections_synced_through_ms;
 }
 
 interface TargetSeed {
@@ -82,8 +91,11 @@ interface VoyagerConn { createdAt: number; vanity: string | null }
  * Fake Playwright Page good enough for syncAcceptedConnections: goto/waitForTimeout are
  * no-ops, url() reports a normal (not logged-out) page, and evaluate() replays canned
  * results in call order: [declaredTotal, ...connectionPages, <empty page to end pagination>].
+ *
+ * A page entry of `null` represents a failed Voyager API call (fetchConnectionsPage
+ * returns null); `[]` represents the natural end of the connections list.
  */
-function makeFakePage(declaredTotal: number | null, connectionPages: VoyagerConn[][]) {
+function makeFakePage(declaredTotal: number | null, connectionPages: Array<VoyagerConn[] | null>) {
   const results: unknown[] = [declaredTotal, ...connectionPages, []];
   let i = 0;
   return {
@@ -237,5 +249,104 @@ describe("syncAcceptedConnections — vanity matching (root bug: trailing-slash-
     const t = readTarget(db, unverifiableId);
     expect(t.degree).toBe(1);
     expect(t.connected_at).toBe("2025-06-01 00:00:00");
+  });
+});
+
+describe("syncAcceptedConnections — boundary commit rule (only advance on proven coverage)", () => {
+  const HOUR = 60 * 60 * 1000;
+
+  it("TEST 1: an incomplete full pass keeps the NULL boundary, stays add-only, and does not phantom-clean", async () => {
+    const db = freshDb();
+    const accountId = seedAccount(db); // boundary NULL => FULL pass
+    const acceptedId = seedTarget(db, { linkedin_url: "https://www.linkedin.com/in/foo" });
+    // degree=1 but absent from the (truncated) Voyager results — a verified-complete pass
+    // would unmark this; an incomplete one must not.
+    const untouchedId = seedTarget(db, {
+      linkedin_url: "https://www.linkedin.com/in/not-in-this-scan",
+      degree: 1,
+      connected_at: "2025-06-01 00:00:00",
+    });
+    // Declares 500 connections but the API dies after the first page (1 pulled).
+    getSessionPageMock.mockResolvedValue(
+      makeFakePage(500, [[{ createdAt: Date.now(), vanity: "foo" }], null])
+    );
+
+    await syncAcceptedConnections(accountId, db);
+
+    // Positive evidence from the page that DID succeed is kept (add-only).
+    expect(readTarget(db, acceptedId).degree).toBe(1);
+    // No destructive phantom cleanup on an unverified pass.
+    expect(readTarget(db, untouchedId).degree).toBe(1);
+    expect(readTarget(db, untouchedId).connected_at).toBe("2025-06-01 00:00:00");
+    // The critical regression: the boundary must stay NULL so the next sync retries FULL.
+    expect(readBoundary(db, accountId)).toBeNull();
+  });
+
+  it("TEST 2: a checksum-verified complete full pass still advances the boundary", async () => {
+    const db = freshDb();
+    const accountId = seedAccount(db); // boundary NULL => FULL pass
+    const targetId = seedTarget(db, { linkedin_url: "https://www.linkedin.com/in/foo" });
+    const newest = Date.now();
+    // declaredTotal === uniquePulled => verified complete
+    getSessionPageMock.mockResolvedValue(makeFakePage(1, [[{ createdAt: newest, vanity: "foo" }]]));
+
+    await syncAcceptedConnections(accountId, db);
+
+    expect(readTarget(db, targetId).degree).toBe(1);
+    expect(readBoundary(db, accountId)).toBe(newest);
+  });
+
+  it("TEST 3: an incremental pass that crosses the old boundary's overlap margin advances", async () => {
+    const db = freshDb();
+    const oldBoundary = Date.now() - 10 * 24 * HOUR;
+    const accountId = seedAccount(db, oldBoundary); // non-null => INCREMENTAL
+    const targetId = seedTarget(db, { linkedin_url: "https://www.linkedin.com/in/foo" });
+    const newest = Date.now();
+    // Second entry is older than (oldBoundary - 24h overlap) => coverage proven.
+    getSessionPageMock.mockResolvedValue(
+      makeFakePage(999, [[
+        { createdAt: newest, vanity: "foo" },
+        { createdAt: oldBoundary - 25 * HOUR, vanity: "someone-older" },
+      ]])
+    );
+
+    await syncAcceptedConnections(accountId, db);
+
+    expect(readTarget(db, targetId).degree).toBe(1);
+    expect(readBoundary(db, accountId)).toBe(newest);
+  });
+
+  it("TEST 4: an incremental pass that fails before reaching the overlap region keeps the OLD boundary", async () => {
+    const db = freshDb();
+    const oldBoundary = Date.now() - 10 * 24 * HOUR;
+    const accountId = seedAccount(db, oldBoundary); // non-null => INCREMENTAL
+    const targetId = seedTarget(db, { linkedin_url: "https://www.linkedin.com/in/foo" });
+    const newest = Date.now();
+    // One good page (still newer than the overlap region), then the API fails.
+    getSessionPageMock.mockResolvedValue(
+      makeFakePage(999, [[{ createdAt: newest, vanity: "foo" }], null])
+    );
+
+    await syncAcceptedConnections(accountId, db);
+
+    // Add-only: the accept we did prove is kept...
+    expect(readTarget(db, targetId).degree).toBe(1);
+    // ...but the unscanned region must be retried, so the boundary must NOT move.
+    expect(readBoundary(db, accountId)).toBe(oldBoundary);
+  });
+
+  it("TEST 5: an incremental pass that reaches the natural end of the list advances", async () => {
+    const db = freshDb();
+    const oldBoundary = Date.now() - 10 * 24 * HOUR;
+    const accountId = seedAccount(db, oldBoundary); // non-null => INCREMENTAL
+    const targetId = seedTarget(db, { linkedin_url: "https://www.linkedin.com/in/foo" });
+    const newest = Date.now();
+    // Never crosses the overlap margin, but the list genuinely ends (trailing []).
+    getSessionPageMock.mockResolvedValue(makeFakePage(999, [[{ createdAt: newest, vanity: "foo" }]]));
+
+    await syncAcceptedConnections(accountId, db);
+
+    expect(readTarget(db, targetId).degree).toBe(1);
+    expect(readBoundary(db, accountId)).toBe(newest);
   });
 });
