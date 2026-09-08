@@ -999,16 +999,6 @@ async function globalLoop(): Promise<void> {
 
   while (true) {
     try {
-      // Personal aggressive mode: pull every list contact into whatever campaign is
-      // currently running and strip Linki's local pacing off that run's account, before
-      // this tick's due-track query runs — so freshly-enrolled contacts are picked up
-      // in the very same iteration instead of waiting for the next one.
-      const { runPersonalAutoEnroll } = await import("@/lib/personal-auto");
-      await runPersonalAutoEnroll(db);
-    } catch (err) {
-      console.error("[runner] Personal auto-enroll error:", err instanceof Error ? err.message : err);
-    }
-    try {
       await tick(db);
     } catch (err) {
       console.error("[runner] Tick error:", err instanceof Error ? err.message : err);
@@ -1029,7 +1019,50 @@ async function globalLoop(): Promise<void> {
   }
 }
 
+/**
+ * Global maintenance task: keeps accepted-connection state (degree=1/connected_at) — and
+ * the downstream /RecruitingOSInbox/referral/linkedin-status.csv export triggered inside
+ * syncAcceptedConnections — fresh independently of whether any campaign is currently
+ * running. A connect-only referral run completes outbound work in seconds and may have no
+ * active run left by the time the recipient actually accepts, so this must NOT be gated on
+ * activeRuns. Runs every tick, but shouldSyncAccepted's own ~1h-per-account gate (see
+ * lib/linkedin/sync-accepted.ts) keeps actual syncs infrequent. Extracted as its own
+ * function so it's testable without exercising the whole global loop.
+ */
+export async function runAcceptedSyncMaintenance(db: ReturnType<typeof getDb>): Promise<void> {
+  const authenticatedAccounts = db.prepare(
+    "SELECT id FROM accounts WHERE is_authenticated = 1"
+  ).all() as { id: string }[];
+
+  for (const { id: accountId } of authenticatedAccounts) {
+    if (!shouldSyncAccepted(accountId)) continue;
+    try {
+      console.log(`[runner] Starting accepted-connections sync for account ${accountId}`);
+      const stamped = await syncAcceptedConnections(accountId);
+      console.log(`[runner] Accepted-connections sync complete — ${stamped} stamped`);
+      if (stamped > 0) {
+        const runningRuns = db.prepare(
+          "SELECT id FROM runs WHERE account_id = ? AND status = 'running'"
+        ).all(accountId) as { id: string }[];
+        for (const r of runningRuns) {
+          log(db, r.id, null, "info", `Accepted-connections sync: ${stamped} contact${stamped === 1 ? "" : "s"} marked as connected`);
+        }
+      }
+    } catch (e) {
+      console.warn("[runner] Accepted-connections sync error:", e instanceof Error ? e.message : e);
+    }
+  }
+}
+
 async function tick(db: ReturnType<typeof getDb>): Promise<void> {
+  try {
+    // Runs first and unconditionally — must not depend on (or be skipped by) whether any
+    // campaign is active. See runAcceptedSyncMaintenance's own doc comment.
+    await runAcceptedSyncMaintenance(db);
+  } catch (err) {
+    console.error("[runner] Accepted-sync maintenance error:", err instanceof Error ? err.message : err);
+  }
+
   const activeRuns = db.prepare(`
     SELECT r.id as run_id, r.workflow_id, r.account_id, r.email_account_id,
            a.daily_connection_limit, a.daily_message_limit, a.daily_inmail_limit,
@@ -1047,24 +1080,6 @@ async function tick(db: ReturnType<typeof getDb>): Promise<void> {
   for (const run of activeRuns) {
     if (seenAccounts.has(run.account_id)) continue;
     seenAccounts.add(run.account_id);
-  }
-
-  // Daily sync: stamp accepted connections from invitation manager (once per 23h per account)
-  for (const accountId of seenAccounts) {
-    if (shouldSyncAccepted(accountId)) {
-      try {
-        console.log(`[runner] Starting accepted-connections sync for account ${accountId}`);
-        const stamped = await syncAcceptedConnections(accountId);
-        if (stamped > 0) {
-          for (const r of activeRuns.filter(x => x.account_id === accountId)) {
-            log(db, r.run_id, null, "info", `Accepted-connections sync: ${stamped} contact${stamped === 1 ? "" : "s"} marked as connected`);
-          }
-        }
-        console.log(`[runner] Accepted-connections sync complete — ${stamped} stamped`);
-      } catch (e) {
-        console.warn("[runner] Accepted-connections sync error:", e instanceof Error ? e.message : e);
-      }
-    }
   }
 
   // LinkedIn inbox reply detection (messaging GraphQL) — once per 15min per

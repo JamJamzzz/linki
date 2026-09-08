@@ -165,16 +165,44 @@ export function createRun(db: DB, params: CreateRunParams): CreateRunResult {
 }
 
 /**
- * Start a pending run, exactly as POST /api/runs/[id]/start does.
+ * For a fire-and-forget run only (see isFireAndForgetWorkflow): skips Linki's normal
+ * pending -> spread-across-the-day enrollment (spreadEnrollBatch in lib/linkedin/runner.ts)
+ * for THIS run's own LinkedIn track-runs, so the very next runner tick (~3s) can act on
+ * them instead of them being scheduled at a random time later in the account's active
+ * window. Does not add, remove, or reassign any target — it only flips already-created
+ * 'pending' rows belonging to this run to 'in_progress' with next_step_at cleared, and
+ * touches no other run. Every one of the runner's normal execution-time gates (daily
+ * limits, active hours, working days, already-connected/pending handling, LinkedIn error
+ * handling) still applies once the runner picks the track up — this removes only the
+ * artificial scheduling delay, never an account safety setting.
+ */
+export function activateFireAndForgetRunImmediately(db: DB, runId: string, workflowId: string): void {
+  if (!isFireAndForgetWorkflow(db, workflowId)) return;
+  db.prepare(
+    `UPDATE run_profile_tracks
+     SET state = 'in_progress', next_step_at = NULL
+     WHERE track = 'linkedin' AND state = 'pending'
+       AND run_profile_id IN (SELECT id FROM run_profiles WHERE run_id = ?)`
+  ).run(runId);
+}
+
+/**
+ * Start a pending run, exactly as POST /api/runs/[id]/start does. Also activates a
+ * fire-and-forget run's tracks immediately (see activateFireAndForgetRunImmediately) — a
+ * no-op for any other workflow shape.
  */
 export function startRun(db: DB, runId: string): { ok: true } | { ok: false; error: string } {
-  const run = db.prepare("SELECT status FROM runs WHERE id = ?").get(runId) as { status: string } | undefined;
+  const run = db.prepare("SELECT status, workflow_id FROM runs WHERE id = ?").get(runId) as
+    | { status: string; workflow_id: string }
+    | undefined;
   if (!run) return { ok: false, error: "Run not found" };
   if (run.status === "running") return { ok: false, error: "Run already running" };
 
   db.prepare(
     "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, datetime('now')) WHERE id = ?"
   ).run(runId);
+
+  activateFireAndForgetRunImmediately(db, runId, run.workflow_id);
 
   ensureGlobalRunnerStarted();
 

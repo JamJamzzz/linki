@@ -1,17 +1,24 @@
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect, beforeAll, vi } from "vitest";
 import { randomUUID } from "crypto";
 import type DatabaseType from "better-sqlite3";
+
+// startRun() calls ensureGlobalRunnerStarted(), which would otherwise spin up the real
+// infinite global loop against the real (non-test) DB file. lib/runs.ts imports nothing
+// else from this module, so a full stub is enough.
+vi.mock("@/lib/linkedin/runner", () => ({ ensureGlobalRunnerStarted: vi.fn() }));
 
 type DB = DatabaseType.Database;
 
 let createDatabase: typeof import("@/lib/db").createDatabase;
 let createRun: typeof import("@/lib/runs").createRun;
+let startRun: typeof import("@/lib/runs").startRun;
 let isFireAndForgetWorkflow: typeof import("@/lib/runs").isFireAndForgetWorkflow;
+let activateFireAndForgetRunImmediately: typeof import("@/lib/runs").activateFireAndForgetRunImmediately;
 
 beforeAll(async () => {
   process.env.NEXTAUTH_SECRET = "test-secret-test-secret-test-secret";
   ({ createDatabase } = await import("@/lib/db"));
-  ({ createRun, isFireAndForgetWorkflow } = await import("@/lib/runs"));
+  ({ createRun, startRun, isFireAndForgetWorkflow, activateFireAndForgetRunImmediately } = await import("@/lib/runs"));
 });
 
 function freshDb(): DB {
@@ -182,5 +189,140 @@ describe("createRun — fire-and-forget concurrency (Problem 2)", () => {
     const second = createRun(db, { workflowId, listId: listB.listId, accountId });
     expect(second.ok).toBe(false);
     if (!second.ok) expect(second.error).toBe("workflow_already_active");
+  });
+});
+
+function trackStates(db: DB, runId: string): { state: string; next_step_at: string | null }[] {
+  return db.prepare(
+    `SELECT rt.state, rt.next_step_at FROM run_profile_tracks rt
+     JOIN run_profiles rp ON rp.id = rt.run_profile_id
+     WHERE rp.run_id = ?`
+  ).all(runId) as { state: string; next_step_at: string | null }[];
+}
+
+describe("createRun — no global list pollution (Problem 2)", () => {
+  it("a fire-and-forget run created from list A contains only list A's targets", () => {
+    const db = freshDb();
+    const accountId = seedAccount(db);
+    const workflowId = seedWorkflow(db, [{ step_type: "connect" }]);
+    const listA = seedList(db, [seedTarget(db), seedTarget(db)]);
+    seedList(db, [seedTarget(db), seedTarget(db)]); // unrelated list B, never referenced
+
+    const created = createRun(db, { workflowId, listId: listA.listId, accountId });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const enrolledTargetIds = (db.prepare("SELECT target_id FROM run_profiles WHERE run_id = ?").all(created.runId) as { target_id: string }[])
+      .map((r) => r.target_id)
+      .sort();
+    expect(enrolledTargetIds).toEqual([...listA.targetIds].sort());
+  });
+
+  it("targets that exist only in an unrelated list are never enrolled anywhere", () => {
+    const db = freshDb();
+    const accountId = seedAccount(db);
+    const workflowId = seedWorkflow(db, [{ step_type: "connect" }]);
+    const listA = seedList(db, [seedTarget(db)]);
+    const listB = seedList(db, [seedTarget(db), seedTarget(db)]);
+
+    const created = createRun(db, { workflowId, listId: listA.listId, accountId });
+    expect(created.ok).toBe(true);
+
+    for (const targetId of listB.targetIds) {
+      const enrolled = db.prepare("SELECT COUNT(*) as c FROM run_profiles WHERE target_id = ?").get(targetId) as { c: number };
+      expect(enrolled.c).toBe(0);
+    }
+  });
+});
+
+describe("activateFireAndForgetRunImmediately (Problem 3: immediate activation, no scheduling spread)", () => {
+  it("flips a fire-and-forget run's own pending LinkedIn tracks to in_progress with next_step_at cleared", () => {
+    const db = freshDb();
+    const accountId = seedAccount(db);
+    const workflowId = seedWorkflow(db, [{ step_type: "connect" }]);
+    const list = seedList(db, [seedTarget(db), seedTarget(db)]);
+    const created = createRun(db, { workflowId, listId: list.listId, accountId });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    expect(trackStates(db, created.runId).every((t) => t.state === "pending")).toBe(true);
+
+    activateFireAndForgetRunImmediately(db, created.runId, workflowId);
+
+    const after = trackStates(db, created.runId);
+    expect(after).toHaveLength(2);
+    expect(after.every((t) => t.state === "in_progress" && t.next_step_at === null)).toBe(true);
+  });
+
+  it("is a no-op for a non-fire-and-forget workflow — existing pending/spread pacing is preserved", () => {
+    const db = freshDb();
+    const accountId = seedAccount(db);
+    const workflowId = seedWorkflow(db, [{ step_type: "connect" }, { step_type: "message" }]);
+    const list = seedList(db, [seedTarget(db)]);
+    const created = createRun(db, { workflowId, listId: list.listId, accountId });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    activateFireAndForgetRunImmediately(db, created.runId, workflowId);
+
+    expect(trackStates(db, created.runId).every((t) => t.state === "pending")).toBe(true);
+  });
+
+  it("does not touch another run's tracks", () => {
+    const db = freshDb();
+    const accountId = seedAccount(db);
+    const workflowA = seedWorkflow(db, [{ step_type: "connect" }]);
+    const workflowB = seedWorkflow(db, [{ step_type: "connect" }]);
+    const listA = seedList(db, [seedTarget(db)]);
+    const listB = seedList(db, [seedTarget(db)]);
+    const runA = createRun(db, { workflowId: workflowA, listId: listA.listId, accountId });
+    const runB = createRun(db, { workflowId: workflowB, listId: listB.listId, accountId });
+    expect(runA.ok && runB.ok).toBe(true);
+    if (!runA.ok || !runB.ok) return;
+
+    activateFireAndForgetRunImmediately(db, runA.runId, workflowA);
+
+    expect(trackStates(db, runB.runId).every((t) => t.state === "pending")).toBe(true);
+  });
+
+  it("startRun() activates a fire-and-forget run's tracks as part of starting it", () => {
+    const db = freshDb();
+    const accountId = seedAccount(db);
+    const workflowId = seedWorkflow(db, [{ step_type: "connect" }]);
+    const list = seedList(db, [seedTarget(db)]);
+    const created = createRun(db, { workflowId, listId: list.listId, accountId });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const started = startRun(db, created.runId);
+    expect(started.ok).toBe(true);
+
+    expect(trackStates(db, created.runId).every((t) => t.state === "in_progress" && t.next_step_at === null)).toBe(true);
+  });
+});
+
+describe("startRun — does not mutate account safety settings (Problem 2)", () => {
+  it("starting a fire-and-forget referral run leaves daily limits and schedule untouched", () => {
+    const db = freshDb();
+    const accountId = seedAccount(db);
+    const before = db.prepare(
+      `SELECT daily_connection_limit, daily_message_limit, daily_inmail_limit,
+              active_hours_start, active_hours_end, working_days
+       FROM accounts WHERE id = ?`
+    ).get(accountId);
+
+    const workflowId = seedWorkflow(db, [{ step_type: "connect" }]);
+    const list = seedList(db, [seedTarget(db)]);
+    const created = createRun(db, { workflowId, listId: list.listId, accountId });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+    startRun(db, created.runId);
+
+    const after = db.prepare(
+      `SELECT daily_connection_limit, daily_message_limit, daily_inmail_limit,
+              active_hours_start, active_hours_end, working_days
+       FROM accounts WHERE id = ?`
+    ).get(accountId);
+    expect(after).toEqual(before);
   });
 });
