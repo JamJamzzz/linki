@@ -216,7 +216,11 @@ export async function syncAcceptedConnections(accountId: string, db: DatabaseTyp
       const tx = db.transaction((rows: typeof deg1) => {
         for (const t of rows) {
           const v = extractLinkedinVanity(t.linkedin_url);
-          if (!v || !seenVanities.has(v)) {
+          // No canonical /in/ vanity to check (e.g. a Sales Nav or other non-profile URL) —
+          // this vanity-based full pass simply can't verify this row either way, so it's
+          // unverifiable, not proven phantom. Leave degree/connected_at untouched.
+          if (!v) continue;
+          if (!seenVanities.has(v)) {
             unmark.run(t.id);
             unmarked++;
           }

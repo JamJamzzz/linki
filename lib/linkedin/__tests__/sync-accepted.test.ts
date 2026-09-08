@@ -215,4 +215,27 @@ describe("syncAcceptedConnections — vanity matching (root bug: trailing-slash-
     expect(t.degree).toBeNull();
     expect(t.connected_at).toBeNull();
   });
+
+  it("verified full-pass phantom cleanup preserves a degree=1 row whose URL has no extractable /in/ vanity", async () => {
+    const db = freshDb();
+    const accountId = seedAccount(db);
+    // A Sales Navigator (non-/in/) URL — extractLinkedinVanity() intentionally returns
+    // null for this, so this row is unverifiable by the vanity-based full pass, not
+    // proven phantom. It must be left alone even though its vanity is absent from
+    // seenVanities (there is no vanity to look up in the first place).
+    const unverifiableId = seedTarget(db, {
+      linkedin_url: "https://www.linkedin.com/sales/lead/abc123",
+      degree: 1,
+      connected_at: "2025-06-01 00:00:00",
+    });
+    // declaredTotal=0 and no connections at all => verified-complete empty full pass —
+    // the same conditions that DO unmark a genuine /in/ phantom in the test above.
+    getSessionPageMock.mockResolvedValue(makeFakePage(0, []));
+
+    await syncAcceptedConnections(accountId, db);
+
+    const t = readTarget(db, unverifiableId);
+    expect(t.degree).toBe(1);
+    expect(t.connected_at).toBe("2025-06-01 00:00:00");
+  });
 });
