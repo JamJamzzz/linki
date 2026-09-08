@@ -1,4 +1,5 @@
 import type { Page } from "playwright";
+import type DatabaseType from "better-sqlite3";
 import { getDb } from "@/lib/db";
 import { getSessionPage, saveSessionState, markNeedsReauth } from "@/lib/linkedin/session";
 import { exportLinkedinStatusSnapshot } from "@/lib/dropbox/export-status";
@@ -43,8 +44,54 @@ const MAX_PAGES = 60; // safety cap (60 * 100 = 6000)
 const OVERLAP_MARGIN_MS = 24 * 60 * 60 * 1000; // re-check a day of overlap (idempotent)
 const DECORATION = "com.linkedin.voyager.dash.deco.web.mynetwork.ConnectionListWithProfile-16";
 
-export function shouldSyncAccepted(accountId: string): boolean {
-  const db = getDb();
+/**
+ * Canonical LinkedIn `/in/` vanity identity — the ONE definition used everywhere accepted-
+ * sync needs to compare a stored targets.linkedin_url against a Voyager publicIdentifier
+ * (stamping AND phantom-cleanup both call this; there must never be two slightly different
+ * regexes doing the same job).
+ *
+ * Finds the first `/in/<slug>` segment; the slug ends at the next `/`, `?`, `#`, or end of
+ * string — so it does NOT assume a trailing slash, and it does NOT swallow a trailing
+ * locale segment like `/en`. Returns null for anything without a `/in/` segment (company
+ * pages, Sales Nav-only URLs, empty/missing values).
+ *
+ * Real stored URLs seen in practice, all of which must resolve to the same key "foo":
+ *   https://linkedin.com/in/foo
+ *   https://www.linkedin.com/in/foo/
+ *   https://www.linkedin.com/in/foo/en
+ *   https://www.linkedin.com/in/foo?trk=abc
+ *   https://www.linkedin.com/in/foo#section
+ *   https://WWW.LINKEDIN.COM/in/Foo/
+ */
+export function extractLinkedinVanity(url: string | null | undefined): string | null {
+  if (!url) return null;
+  const m = url.match(/\/in\/([^/?#]+)/i);
+  if (!m) return null;
+  let slug = m[1];
+  try {
+    slug = decodeURIComponent(slug);
+  } catch {
+    // Malformed percent-encoding — fall back to the raw slug rather than throwing.
+  }
+  slug = slug.trim().toLowerCase();
+  return slug || null;
+}
+
+/** Normalizes a raw Voyager `publicIdentifier` to the same vanity identity space. */
+function normalizeVoyagerVanity(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let v = raw.trim();
+  if (!v) return null;
+  try {
+    v = decodeURIComponent(v);
+  } catch {
+    // keep as-is
+  }
+  v = v.trim().toLowerCase();
+  return v || null;
+}
+
+export function shouldSyncAccepted(accountId: string, db: DatabaseType.Database = getDb()): boolean {
   const row = db.prepare("SELECT accepted_sync_at FROM accounts WHERE id = ?").get(accountId) as
     | { accepted_sync_at: string | null }
     | undefined;
@@ -57,8 +104,7 @@ interface ApiConnection {
   createdAt: number; // epoch ms
 }
 
-export async function syncAcceptedConnections(accountId: string): Promise<number> {
-  const db = getDb();
+export async function syncAcceptedConnections(accountId: string, db: DatabaseType.Database = getDb()): Promise<number> {
   const page = await getSessionPage(accountId);
   let stamped = 0;
 
@@ -86,10 +132,23 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
       return m ? parseInt(m[1].replace(/[.,]/g, ""), 10) : null;
     });
 
-    const findByVanity = db.prepare(
-      `SELECT id, full_name, connected_at, degree FROM targets
-       WHERE linkedin_url LIKE ? AND connection_requested_at IS NOT NULL`
-    );
+    // Load once per pass and index by canonical vanity — cheap for a personal-scale
+    // contact list, and avoids repeated SQL wildcard matching (see extractLinkedinVanity).
+    // A vanity can map to more than one row: two different exact stored URLs (e.g. with vs
+    // without a trailing slash, or a different query/locale suffix) can normalize to the
+    // same identity.
+    interface TargetRow { id: string; full_name: string | null; linkedin_url: string; connected_at: string | null; degree: number | null }
+    const targetRows = db.prepare(
+      `SELECT id, full_name, linkedin_url, connected_at, degree FROM targets
+       WHERE connection_requested_at IS NOT NULL AND linkedin_url IS NOT NULL`
+    ).all() as TargetRow[];
+    const targetsByVanity = new Map<string, TargetRow[]>();
+    for (const t of targetRows) {
+      const vanity = extractLinkedinVanity(t.linkedin_url);
+      if (!vanity) continue;
+      const bucket = targetsByVanity.get(vanity);
+      if (bucket) bucket.push(t); else targetsByVanity.set(vanity, [t]);
+    }
     const stampAccepted = db.prepare(
       "UPDATE targets SET degree = 1, connected_at = COALESCE(connected_at, ?) WHERE id = ?"
     );
@@ -109,7 +168,8 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
 
       for (const c of conns) {
         uniquePulled++;
-        if (c.vanity) seenVanities.add(c.vanity);
+        const vanity = normalizeVoyagerVanity(c.vanity);
+        if (vanity) seenVanities.add(vanity);
         if (newestSeen === null || c.createdAt > newestSeen) newestSeen = c.createdAt;
 
         // Incremental early-exit (list is newest-first).
@@ -117,15 +177,19 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
           reachedBoundary = true;
           break;
         }
-        if (!c.vanity) continue;
+        if (!vanity) continue;
 
-        for (const m of findByVanity.all(`%/in/${c.vanity}/%`) as Array<{
-          id: string; full_name: string | null; connected_at: string | null; degree: number | null;
-        }>) {
+        const matches = targetsByVanity.get(vanity);
+        if (!matches) continue;
+        for (const m of matches) {
           if (m.degree === 1 && m.connected_at) continue; // already correct
           stampAccepted.run(msToSqlite(c.createdAt), m.id);
-          console.log(`[sync-accepted] Accepted: ${m.full_name ?? c.vanity}`);
+          console.log(`[sync-accepted] Accepted: ${m.full_name ?? vanity}`);
           stamped++;
+          // Keep the in-memory snapshot in sync so a repeat sighting within this same
+          // pass (e.g. two stored URL variants of the same vanity) stays idempotent.
+          m.degree = 1;
+          m.connected_at = m.connected_at ?? msToSqlite(c.createdAt);
         }
       }
 
@@ -143,14 +207,15 @@ export async function syncAcceptedConnections(accountId: string): Promise<number
     // incremental/incomplete pass — a partial pull must not wipe real accepts.
     let unmarked = 0;
     if (verifiedComplete) {
+      // Same canonical vanity helper as the stamping loop above — one definition of
+      // LinkedIn /in/ identity for both directions of this sync.
       const deg1 = db.prepare(
-        "SELECT id, full_name, linkedin_url FROM targets WHERE degree = 1 AND linkedin_url LIKE '%/in/%'"
+        "SELECT id, full_name, linkedin_url FROM targets WHERE degree = 1 AND linkedin_url IS NOT NULL"
       ).all() as Array<{ id: string; full_name: string | null; linkedin_url: string }>;
       const unmark = db.prepare("UPDATE targets SET degree = NULL, connected_at = NULL WHERE id = ?");
       const tx = db.transaction((rows: typeof deg1) => {
         for (const t of rows) {
-          const mm = t.linkedin_url.match(/\/in\/([^/?#]+)/);
-          const v = mm ? decodeURIComponent(mm[1]).toLowerCase() : null;
+          const v = extractLinkedinVanity(t.linkedin_url);
           if (!v || !seenVanities.has(v)) {
             unmark.run(t.id);
             unmarked++;

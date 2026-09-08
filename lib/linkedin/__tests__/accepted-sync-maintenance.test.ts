@@ -55,8 +55,8 @@ describe("runAcceptedSyncMaintenance (Problem 1: accepted sync independent of ac
 
     await runAcceptedSyncMaintenance(db);
 
-    expect(shouldSyncAcceptedMock).toHaveBeenCalledWith(accountId);
-    expect(syncAcceptedConnectionsMock).toHaveBeenCalledWith(accountId);
+    expect(shouldSyncAcceptedMock).toHaveBeenCalledWith(accountId, db);
+    expect(syncAcceptedConnectionsMock).toHaveBeenCalledWith(accountId, db);
   });
 
   it("still runs accepted sync when a campaign is active for that account", async () => {
@@ -73,7 +73,7 @@ describe("runAcceptedSyncMaintenance (Problem 1: accepted sync independent of ac
 
     await runAcceptedSyncMaintenance(db);
 
-    expect(syncAcceptedConnectionsMock).toHaveBeenCalledWith(accountId);
+    expect(syncAcceptedConnectionsMock).toHaveBeenCalledWith(accountId, db);
   });
 
   it("does not call syncAcceptedConnections when shouldSyncAccepted says it isn't due yet", async () => {

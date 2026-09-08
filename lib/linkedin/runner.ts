@@ -1035,10 +1035,10 @@ export async function runAcceptedSyncMaintenance(db: ReturnType<typeof getDb>): 
   ).all() as { id: string }[];
 
   for (const { id: accountId } of authenticatedAccounts) {
-    if (!shouldSyncAccepted(accountId)) continue;
+    if (!shouldSyncAccepted(accountId, db)) continue;
     try {
       console.log(`[runner] Starting accepted-connections sync for account ${accountId}`);
-      const stamped = await syncAcceptedConnections(accountId);
+      const stamped = await syncAcceptedConnections(accountId, db);
       console.log(`[runner] Accepted-connections sync complete — ${stamped} stamped`);
       if (stamped > 0) {
         const runningRuns = db.prepare(

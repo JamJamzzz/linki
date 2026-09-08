@@ -11,6 +11,7 @@
     "lint": "eslint",
     "mirror:ee": "node scripts/mirror-ee.js",
     "dropbox:intake": "tsx scripts/dropbox-intake.ts",
+    "accepted-sync:force-full": "tsx scripts/reset-accepted-sync-boundary.ts",
     "test": "vitest run"
   },
   "dependencies": {
