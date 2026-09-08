@@ -12,6 +12,7 @@ scripts/*
 !scripts/mirror-ee.js
 !scripts/strip-mirrored-pages.js
 !scripts/dropbox-intake.ts
+!scripts/reset-accepted-sync-boundary.ts
 mcp/
 playwright-browsers/
 .env*
